@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import argparse
+import html
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -234,6 +235,130 @@ def fmt_hour(h):
     return f"{h:02d}:00"
 
 
+def commute_label(mins):
+    if mins <= 30:
+        return "Great"
+    if mins <= 45:
+        return "Good"
+    if mins <= 60:
+        return "Busy"
+    return "Heavy"
+
+
+def css_class_for_eta(mins):
+    if mins <= 30:
+        return "good"
+    if mins <= 45:
+        return "ok"
+    if mins <= 60:
+        return "warn"
+    return "bad"
+
+
+def window_stats(data):
+    if not data:
+        return None
+    best = min(data, key=lambda p: p["eta_min"])
+    worst = max(data, key=lambda p: p["eta_min"])
+    avg = round(sum(p["eta_min"] for p in data) / len(data))
+    return {"best": best, "worst": worst, "avg": avg, "spread": worst["eta_min"] - best["eta_min"]}
+
+
+def escape(value):
+    return html.escape(str(value), quote=True)
+
+
+def build_email_html(home_to_office, office_to_home, options, args):
+    now = datetime.now()
+    sorted_options = sorted(options, key=lambda o: o["total_commute"])
+    best_option = sorted_options[0] if sorted_options else None
+
+    morning_visible = [
+        p for p in home_to_office
+        if args.arrive_start <= hour_of(p["depart"] + timedelta(minutes=p["eta_min"])) <= args.arrive_end
+    ]
+    evening_visible = filter_by_hour(office_to_home, args.leave_start, args.leave_end)
+    morning_stats = window_stats(morning_visible)
+    evening_stats = window_stats(evening_visible)
+
+    alerts = []
+    if best_option:
+        alerts.append(("Leave home", fmt_time(best_option["leave_home"]),
+                       f"Best total commute: {fmt_duration(best_option['total_commute'])}"))
+        alerts.append(("Leave office", fmt_time(best_option["leave_office"]),
+                       f"Reach home by {fmt_time(best_option['reach_home'])}"))
+    if morning_stats and morning_stats["spread"] >= 15:
+        alerts.append(("Morning alarm", fmt_time(morning_stats["best"]["depart"]),
+                       f"Avoid {fmt_time(morning_stats['worst']['depart'])}: +{morning_stats['spread']} min"))
+    if evening_stats and evening_stats["spread"] >= 15:
+        alerts.append(("Evening alarm", fmt_time(evening_stats["best"]["depart"]),
+                       f"Avoid {fmt_time(evening_stats['worst']['depart'])}: +{evening_stats['spread']} min"))
+
+    def metric_card(title, stats):
+        if not stats:
+            return f'<div class="card"><h3>{escape(title)}</h3><p>No data in window.</p></div>'
+        return f"""<div class="card">
+          <h3>{escape(title)}</h3>
+          <div class="metric {css_class_for_eta(stats['best']['eta_min'])}">{fmt_duration(stats['best']['eta_min'])}</div>
+          <p>Best at <b>{fmt_time(stats['best']['depart'])}</b></p>
+          <p>Average {fmt_duration(stats['avg'])} · Worst {fmt_duration(stats['worst']['eta_min'])} at {fmt_time(stats['worst']['depart'])}</p>
+        </div>"""
+
+    def graph_rows(data, best_eta):
+        if not data:
+            return '<tr><td colspan="4">No predictions available.</td></tr>'
+        max_eta = max(p["eta_min"] for p in data)
+        rows = []
+        for p in data:
+            pct = max(4, round(p["eta_min"] / max(max_eta, 1) * 100))
+            badge = "Best" if p["eta_min"] <= best_eta + 2 else commute_label(p["eta_min"])
+            rows.append(f"""<tr>
+              <td>{fmt_time_full(p['depart'])}</td>
+              <td><div class="bar"><span class="{css_class_for_eta(p['eta_min'])}" style="width:{pct}%"></span></div></td>
+              <td><b>{fmt_duration(p['eta_min'])}</b></td>
+              <td><span class="pill {css_class_for_eta(p['eta_min'])}">{badge}</span></td>
+            </tr>""")
+        return "".join(rows)
+
+    option_rows = []
+    for i, opt in enumerate(sorted_options[:5], 1):
+        option_rows.append(f"""<tr>
+          <td>#{i}</td><td>{fmt_time(opt['leave_home'])}</td><td>{fmt_time(opt['reach_office'])}</td>
+          <td>{opt['office_hours']}h</td><td>{fmt_time(opt['leave_office'])}</td><td>{fmt_time(opt['reach_home'])}</td>
+          <td><b>{fmt_duration(opt['total_commute'])}</b></td>
+        </tr>""")
+    if not option_rows:
+        option_rows.append('<tr><td colspan="7">No valid schedule options found.</td></tr>')
+
+    alert_html = "".join(
+        f'<li><b>{escape(title)}:</b> {escape(time_text)} — {escape(detail)}</li>'
+        for title, time_text, detail in alerts
+    ) or "<li>No alarms today; traffic looks steady in your configured windows.</li>"
+
+    morning_best = morning_stats["best"]["eta_min"] if morning_stats else 0
+    evening_best = evening_stats["best"]["eta_min"] if evening_stats else 0
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body{{margin:0;background:#f3f6fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}}
+.container{{max-width:860px;margin:0 auto;padding:24px}} .hero{{background:linear-gradient(135deg,#173b7a,#28a0f0);color:white;border-radius:20px;padding:28px}}
+.hero h1{{margin:0 0 8px;font-size:28px}} .sub{{opacity:.9;margin:0}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:18px 0}}
+.card{{background:white;border-radius:16px;padding:18px;box-shadow:0 8px 24px rgba(23,32,51,.08)}} h2{{margin:26px 0 10px}} h3{{margin:0 0 8px;color:#42526b}}
+.metric{{font-size:34px;font-weight:800}} .good{{color:#0f9f6e;background:#dcfce7}} .ok{{color:#1d70b8;background:#dbeafe}} .warn{{color:#b7791f;background:#fef3c7}} .bad{{color:#c53030;background:#fee2e2}}
+table{{width:100%;border-collapse:collapse;background:white;border-radius:16px;overflow:hidden;box-shadow:0 8px 24px rgba(23,32,51,.08)}} th,td{{padding:12px;border-bottom:1px solid #eef2f7;text-align:left}} th{{background:#f8fafc;color:#526071;font-size:12px;text-transform:uppercase}}
+.bar{{height:10px;background:#edf2f7;border-radius:99px;overflow:hidden;min-width:120px}} .bar span{{display:block;height:10px;border-radius:99px}} .pill{{border-radius:99px;padding:4px 9px;font-size:12px;font-weight:700}}
+ul.alerts{{background:white;border-radius:16px;padding:18px 18px 18px 36px;box-shadow:0 8px 24px rgba(23,32,51,.08)}} .footer{{color:#68758a;font-size:12px;margin-top:18px}}
+</style></head><body><div class="container">
+  <div class="hero"><h1>🚗 Daily Commute Intelligence</h1><p class="sub">Generated {escape(now.strftime('%d %b %Y, %I:%M %p'))} · {escape(HOME)} ⇄ {escape(OFFICE)}</p></div>
+  <div class="grid">{metric_card('Morning trend', morning_stats)}{metric_card('Evening trend', evening_stats)}</div>
+  <h2>⏰ Recommended alarms</h2><ul class="alerts">{alert_html}</ul>
+  <h2>🏆 Best full-day commute plans</h2><table><thead><tr><th>Rank</th><th>Leave home</th><th>Reach office</th><th>Office</th><th>Leave office</th><th>Reach home</th><th>Total</th></tr></thead><tbody>{"".join(option_rows)}</tbody></table>
+  <h2>📈 Morning departure trend</h2><table><thead><tr><th>Depart</th><th>Trend</th><th>ETA</th><th>Status</th></tr></thead><tbody>{graph_rows(morning_visible, morning_best)}</tbody></table>
+  <h2>📉 Evening departure trend</h2><table><thead><tr><th>Depart</th><th>Trend</th><th>ETA</th><th>Status</th></tr></thead><tbody>{graph_rows(evening_visible, evening_best)}</tbody></table>
+  <p class="footer">Tip: set calendar alarms for the recommended leave times and avoid the listed worst slots when the spread is high.</p>
+</div></body></html>"""
+
+
 def print_traffic_breakdown(home_to_office, office_to_home,
                              arrive_start, arrive_end, leave_start, leave_end):
     print(f"\n\n  BEST & WORST TIMES (practical window)")
@@ -317,6 +442,8 @@ def main():
                         help=f"Latest departure hour from office (default: {DEFAULT_LEAVE_OFFICE_END})")
     parser.add_argument("--compact", action="store_true",
                         help="Show only the schedule summary (skip graphs)")
+    parser.add_argument("--email-html", metavar="PATH",
+                        help="Write an HTML email report to PATH")
     args = parser.parse_args()
 
     if not GOOGLE_API_KEY:
@@ -352,6 +479,11 @@ def main():
     )
 
     print_top_options(options)
+
+    if args.email_html:
+        with open(args.email_html, "w", encoding="utf-8") as f:
+            f.write(build_email_html(home_to_office, office_to_home, options, args))
+        print(f"\n  HTML email report written to {args.email_html}")
 
     if not args.compact:
         print_commute_graph(home_to_office, office_to_home,
