@@ -1,0 +1,42 @@
+name: Daily Commute Report
+
+on:
+  schedule:
+    # Runs at 7:30 AM IST (2:00 UTC) on weekdays
+    - cron: "0 2 * * 1-5"
+  workflow_dispatch:  # allows manual trigger
+
+jobs:
+  commute-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate commute report
+        id: report
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          python commute_report.py --compact > report.txt 2>&1
+          echo "REPORT<<EOF" >> $GITHUB_ENV
+          cat report.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Send email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "🚗 Daily Commute Report — ${{ github.event.repository.name }}"
+          body: file://report.txt
+          to: ${{ secrets.MAIL_TO }}
+          from: Commute Bot
