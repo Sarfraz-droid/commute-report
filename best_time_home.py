@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import argparse
+import html
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -104,6 +105,95 @@ def fmt_duration(mins):
     h = mins // 60
     m = mins % 60
     return f"{h}h {m}m" if m else f"{h}h"
+
+
+def escape(value):
+    return html.escape(str(value), quote=True)
+
+
+def css_class_for_eta(mins):
+    if mins <= 30:
+        return "good"
+    if mins <= 45:
+        return "ok"
+    if mins <= 60:
+        return "warn"
+    return "bad"
+
+
+def commute_label(mins):
+    if mins <= 30:
+        return "Great"
+    if mins <= 45:
+        return "Good"
+    if mins <= 60:
+        return "Busy"
+    return "Heavy"
+
+
+def build_email_html(data, leave_start, leave_end, top_n):
+    now = datetime.now()
+    ranked = sorted(data, key=lambda p: p["eta_min"])
+    best = ranked[0] if ranked else None
+    worst = max(data, key=lambda p: p["eta_min"]) if data else None
+    avg = round(sum(p["eta_min"] for p in data) / len(data)) if data else None
+    spread = worst["eta_min"] - best["eta_min"] if best and worst else 0
+
+    alarm_items = []
+    if best:
+        alarm_items.append(f"<li><b>Best leave alarm:</b> {fmt_time(best['depart'])} — reach home by {fmt_time(best['arrival'])}</li>")
+    if spread >= 10:
+        alarm_items.append(f"<li><b>Avoid peak:</b> {fmt_time(worst['depart'])} is {spread} min slower than the best slot.</li>")
+    if not alarm_items:
+        alarm_items.append("<li>Traffic looks steady; leave when convenient in your configured window.</li>")
+
+    top_rows = []
+    for i, p in enumerate(ranked[:top_n], 1):
+        delta = p["eta_min"] - best["eta_min"] if best else 0
+        delta_text = "Best" if delta == 0 else f"+{delta} min"
+        top_rows.append(f"""<tr>
+          <td>#{i}</td><td>{fmt_time(p['depart'])}</td><td>{fmt_time(p['arrival'])}</td>
+          <td><b>{fmt_duration(p['eta_min'])}</b></td><td>{p['distance']} km</td><td><span class="pill {css_class_for_eta(p['eta_min'])}">{delta_text}</span></td>
+        </tr>""")
+    if not top_rows:
+        top_rows.append('<tr><td colspan="6">No predictions available.</td></tr>')
+
+    trend_rows = []
+    max_eta = max((p["eta_min"] for p in data), default=1)
+    best_eta = best["eta_min"] if best else 0
+    for p in data:
+        pct = max(4, round(p["eta_min"] / max(max_eta, 1) * 100))
+        badge = "Best" if p["eta_min"] <= best_eta + 2 else commute_label(p["eta_min"])
+        trend_rows.append(f"""<tr>
+          <td>{fmt_time(p['depart'])}</td>
+          <td><div class="bar"><span class="{css_class_for_eta(p['eta_min'])}" style="width:{pct}%"></span></div></td>
+          <td><b>{fmt_duration(p['eta_min'])}</b></td>
+          <td><span class="pill {css_class_for_eta(p['eta_min'])}">{badge}</span></td>
+        </tr>""")
+    if not trend_rows:
+        trend_rows.append('<tr><td colspan="4">No predictions available.</td></tr>')
+
+    best_metric = fmt_duration(best["eta_min"]) if best else "No data"
+    avg_metric = fmt_duration(avg) if avg is not None else "No data"
+    worst_metric = fmt_duration(worst["eta_min"]) if worst else "No data"
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body{{margin:0;background:#f4f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif}}
+.container{{max-width:820px;margin:0 auto;padding:24px}} .hero{{background:linear-gradient(135deg,#115e59,#22c55e);color:white;border-radius:20px;padding:28px}}
+.hero h1{{margin:0 0 8px;font-size:28px}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin:18px 0}}
+.card,ul.alerts{{background:white;border-radius:16px;padding:18px;box-shadow:0 8px 24px rgba(23,32,51,.08)}} .metric{{font-size:32px;font-weight:800}}
+table{{width:100%;border-collapse:collapse;background:white;border-radius:16px;overflow:hidden;box-shadow:0 8px 24px rgba(23,32,51,.08)}} th,td{{padding:12px;border-bottom:1px solid #eef2f7;text-align:left}} th{{background:#f8fafc;color:#526071;font-size:12px;text-transform:uppercase}}
+.bar{{height:10px;background:#edf2f7;border-radius:99px;overflow:hidden;min-width:120px}} .bar span{{display:block;height:10px;border-radius:99px}} .pill{{border-radius:99px;padding:4px 9px;font-size:12px;font-weight:700}}
+.good{{color:#0f9f6e;background:#dcfce7}} .ok{{color:#1d70b8;background:#dbeafe}} .warn{{color:#b7791f;background:#fef3c7}} .bad{{color:#c53030;background:#fee2e2}} .footer{{color:#68758a;font-size:12px;margin-top:18px}}
+</style></head><body><div class="container">
+  <div class="hero"><h1>🏠 Evening Commute Report</h1><p>Generated {escape(now.strftime('%d %b %Y, %I:%M %p'))} · Leave window {leave_start}:00-{leave_end}:00</p></div>
+  <div class="grid"><div class="card"><h3>Best</h3><div class="metric">{best_metric}</div></div><div class="card"><h3>Average</h3><div class="metric">{avg_metric}</div></div><div class="card"><h3>Worst</h3><div class="metric">{worst_metric}</div></div></div>
+  <h2>⏰ Alarm recommendations</h2><ul class="alerts">{"".join(alarm_items)}</ul>
+  <h2>🏆 Best times to leave</h2><table><thead><tr><th>Rank</th><th>Leave</th><th>Reach home</th><th>ETA</th><th>Distance</th><th>Delta</th></tr></thead><tbody>{"".join(top_rows)}</tbody></table>
+  <h2>📈 Departure trend</h2><table><thead><tr><th>Depart</th><th>Trend</th><th>ETA</th><th>Status</th></tr></thead><tbody>{"".join(trend_rows)}</tbody></table>
+  <p class="footer">Use the best leave alarm when the spread is high; otherwise choose any Good or Great slot.</p>
+</div></body></html>"""
 
 
 def print_header(leave_start, leave_end):
@@ -258,6 +348,8 @@ def main():
                         help="Show only top departures (skip graph and summary)")
     parser.add_argument("--top", type=int, default=TOP_N,
                         help=f"Number of top departures to show (default: {TOP_N})")
+    parser.add_argument("--email-html", metavar="PATH",
+                        help="Write an HTML email report to PATH")
     args = parser.parse_args()
 
     if not GOOGLE_API_KEY:
@@ -275,6 +367,11 @@ def main():
     print_header(args.leave_start, args.leave_end)
     data = fetch_predictions(OFFICE, HOME, args.leave_start, args.leave_end)
     print_top_departures(data, args.top)
+
+    if args.email_html:
+        with open(args.email_html, "w", encoding="utf-8") as f:
+            f.write(build_email_html(data, args.leave_start, args.leave_end, args.top))
+        print(f"\n  HTML email report written to {args.email_html}")
 
     if not args.compact and data:
         print_time_graph(data, args.leave_start, args.leave_end)
